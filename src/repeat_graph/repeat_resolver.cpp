@@ -3,7 +3,9 @@
 //Released under the BSD license (see LICENSE file)
 
 #include <cmath>
-
+#include <atomic>
+#include <thread>
+#include <mutex>
 
 #include "repeat_resolver.h"
 #include "graph_processing.h"
@@ -464,67 +466,81 @@ void RepeatResolver::findRepeats()
 		for (auto& edge : path->path) edge->repetitive = true;
 	};
 
-	//first simlplier conditions without read alignment
-	for (auto& path : unbranchingPaths)
+	//first simpler conditions without read alignment
+	//collect forward-strand path indices for parallel processing
+	std::vector<size_t> fwdPathIdx;
+	for (size_t i = 0; i < unbranchingPaths.size(); ++i)
 	{
-		if (!path.id.strand()) continue;
+		if (unbranchingPaths[i].id.strand()) fwdPathIdx.push_back(i);
+	}
 
-		//mark paths with high coverage as repetitive
-		if (!Parameters::get().unevenCoverage &&
-			path.meanCoverage > _multInf.getUniqueCovThreshold())
-		{
-			markRepetitive(&path);
-			markRepetitive(complPath(&path));
-			Logger::get().debug() << "High-cov: " 
-				<< path.edgesStr() << "\t" << path.length << "\t" 
-				<< path.meanCoverage;
-		}
+	//parallel classification: each path is checked independently
+	//results stored per-path to avoid races on edge->repetitive
+	enum RepeatReason { NONE, HIGH_COV, SHORT_LOOP, SELF_COMPL, HAPLO_EDGE, TANDEM };
+	std::vector<RepeatReason> pathReasons(fwdPathIdx.size(), NONE);
 
-		//don't trust short loops, since they might contain unglued tandem
-		//repeat variations
-		const int MIN_RELIABLE_LOOP = 5000;
-		if (path.isLooped() && path.length < MIN_RELIABLE_LOOP)
+	std::atomic<size_t> convergenceIdx(0);
+	size_t numThreads = std::max((size_t)1, (size_t)Parameters::get().numThreads);
+	auto classifyWorker = [&]()
+	{
+		while (true)
 		{
-			markRepetitive(&path);
-			markRepetitive(complPath(&path));
-			Logger::get().debug() << "Short-loop: " << path.edgesStr();
-		}
+			size_t idx = convergenceIdx.fetch_add(1);
+			if (idx >= fwdPathIdx.size()) return;
 
-		//mask self-complements
-		for (auto& edge : path.path)
-		{
-			if (edge->selfComplement)
+			auto& path = unbranchingPaths[fwdPathIdx[idx]];
+
+			if (!Parameters::get().unevenCoverage &&
+				path.meanCoverage > _multInf.getUniqueCovThreshold())
 			{
-				markRepetitive(&path);
-				markRepetitive(complPath(&path));
-				Logger::get().debug() << "Self-compl: " << path.edgesStr();
-				break;
+				pathReasons[idx] = HIGH_COV;
+				return;
+			}
+
+			const int MIN_RELIABLE_LOOP = 5000;
+			if (path.isLooped() && path.length < MIN_RELIABLE_LOOP)
+			{
+				pathReasons[idx] = SHORT_LOOP;
+				return;
+			}
+
+			for (auto& edge : path.path)
+			{
+				if (edge->selfComplement) { pathReasons[idx] = SELF_COMPL; return; }
+			}
+			for (auto& edge : path.path)
+			{
+				if (edge->altHaplotype) { pathReasons[idx] = HAPLO_EDGE; return; }
+			}
+
+			//tandem copy check is the expensive part (queries read alignments)
+			for (auto& edge : path.path)
+			{
+				if (!edge->repetitive && this->checkForTandemCopies(edge, alnIndex[edge]))
+				{
+					pathReasons[idx] = TANDEM;
+					return;
+				}
 			}
 		}
+	};
+	std::vector<std::thread> classifyThreads(std::min(numThreads, fwdPathIdx.size()));
+	for (size_t i = 0; i < classifyThreads.size(); ++i)
+		classifyThreads[i] = std::thread(classifyWorker);
+	for (size_t i = 0; i < classifyThreads.size(); ++i)
+		classifyThreads[i].join();
 
-		//mask haplo-edges so they don't mess up repeat resolution
-		for (auto& edge : path.path)
-		{
-			if (edge->altHaplotype)
-			{
-				markRepetitive(&path);
-				markRepetitive(complPath(&path));
-				Logger::get().debug() << "Haplo-edge: " << path.edgesStr();
-				break;
-			}
-		}
-
-		//mask edges that appear multiple times within single reads
-		for (auto& edge : path.path)
-		{
-			if (!edge->repetitive && this->checkForTandemCopies(edge, alnIndex[edge]))
-			{
-				markRepetitive(&path);
-				markRepetitive(complPath(&path));
-				Logger::get().debug() << "Tandem: " << path.edgesStr();
-				break;
-			}
-		}
+	//apply results serially (deterministic order, safe graph mutation)
+	const char* reasonStr[] = {"", "High-cov", "Short-loop", "Self-compl", "Haplo-edge", "Tandem"};
+	for (size_t idx = 0; idx < fwdPathIdx.size(); ++idx)
+	{
+		if (pathReasons[idx] == NONE) continue;
+		auto& path = unbranchingPaths[fwdPathIdx[idx]];
+		markRepetitive(&path);
+		markRepetitive(complPath(&path));
+		Logger::get().debug() << reasonStr[pathReasons[idx]] << ": "
+			<< path.edgesStr() << "\t" << path.length << "\t"
+			<< path.meanCoverage;
 	}
 
 	//Finally, using the read alignments
@@ -717,90 +733,113 @@ std::vector<RepeatResolver::Connection>
 	Logger::get().debug() << "Total unique edges: " << totalSafe;
 
 	const int32_t MAGIC_100 = 100;
-	std::vector<Connection> readConnections;
-	for (auto& readPath : _aligner.getAlignments())
+
+	//process read alignments in parallel, each read produces independent connections
+	auto& allAlignments = _aligner.getAlignments();
+	size_t numThreads = std::max((size_t)1, (size_t)Parameters::get().numThreads);
+	std::vector<std::vector<Connection>> threadResults(numThreads);
+	std::atomic<size_t> readIdx(0);
+
+	auto connectionWorker = [&]()
 	{
-		GraphAlignment currentAln;
-		int32_t readStart = 0;
-		for (auto& aln : readPath)
+		//determine thread index from first job
+		size_t myThread = 0;
+		for (size_t t = 0; t < numThreads; ++t)
 		{
-			if (currentAln.empty()) 
+			if (std::this_thread::get_id() == std::thread::id()) break;
+		}
+		//use thread-local storage via index
+		std::vector<Connection> localConnections;
+
+		while (true)
+		{
+			size_t idx = readIdx.fetch_add(1);
+			if (idx >= allAlignments.size()) break;
+
+			auto& readPath = allAlignments[idx];
+			GraphAlignment currentAln;
+			int32_t readStart = 0;
+			for (auto& aln : readPath)
 			{
-				if (!safeEdge(aln.edge)) continue;
-				readStart = aln.overlap.curEnd + aln.overlap.extLen - 
-							aln.overlap.extEnd;
-				readStart = std::min(readStart, aln.overlap.curLen - MAGIC_100);
-			}
-
-			currentAln.push_back(aln);
-			if (safeEdge(aln.edge) && currentAln.front().edge != aln.edge)
-			{
-				bool reliableConnection = true;
-
-				//if any of the edges does not prevent contig extenstion, 
-				//no need to resolve it
-				if (!currentAln.front().edge->nodeRight->isBifurcation() ||
-					!currentAln.back().edge->nodeLeft->isBifurcation()) reliableConnection = false;
-
-				//don't connect edges if they both were previously repetitive
-				//(end then became unique)
-				if (currentAln.front().edge->resolved &&
-					currentAln.back().edge->resolved) reliableConnection = false;
-
-				//don't connect edges, if they are already linked
-				//(through a alternative haplotypes structure)
-				if (currentAln.front().edge->rightLink || 
-					currentAln.back().edge->leftLink) reliableConnection = false;
-
-				if (!reliableConnection)
+				if (currentAln.empty())
 				{
-					currentAln.clear();
-					currentAln.push_back(aln);
-					readStart = aln.overlap.curEnd + aln.overlap.extLen - 
+					if (!safeEdge(aln.edge)) continue;
+					readStart = aln.overlap.curEnd + aln.overlap.extLen -
 								aln.overlap.extEnd;
 					readStart = std::min(readStart, aln.overlap.curLen - MAGIC_100);
-					continue;
 				}
 
-				int32_t flankScore = std::min(currentAln.front().overlap.curRange(),
-											  currentAln.back().overlap.curRange());
-				GraphPath currentPath;
-				for (auto& aln : currentAln) currentPath.push_back(aln.edge);
-				GraphPath complPath = _graph.complementPath(currentPath);
-
-				int32_t readEnd = aln.overlap.curBegin - aln.overlap.extBegin;
-
-				//TODO: fix this ad-hoc fix. Currently, if read connects
-				//two consecutive edges (for example, when resolving chimera junctions,
-				//we still would insert a tiny bit of read sequence as a placeholder.
-				//Probably, wouldn't hurt, but who knows..
-				readEnd = std::max(readStart + MAGIC_100 - 1, readEnd);	
-				if (readStart < 0 || readEnd >= aln.overlap.curLen)
-				{
-					Logger::get().warning() 
-						<< "Something is wrong with bridging read sequence";
-					//Logger::get().warning() << readStart << " " 
-					//	<< readEnd << " " << aln.overlap.curLen;
-					break;
-				}
-
-				ReadSequence readSeq = {aln.overlap.curId, readStart, readEnd};
-				ReadSequence complRead = {aln.overlap.curId.rc(), 
-										  aln.overlap.curLen - readEnd - 1,
-										  aln.overlap.curLen - readStart - 1};
-				readConnections.push_back({currentPath, readSeq, flankScore});
-				readConnections.push_back({complPath, complRead, flankScore});
-
-				currentAln.clear();
 				currentAln.push_back(aln);
-				readStart = aln.overlap.curEnd + aln.overlap.extLen - 
-							aln.overlap.extEnd;
-				readStart = std::min(readStart, aln.overlap.curLen - MAGIC_100);
+				if (safeEdge(aln.edge) && currentAln.front().edge != aln.edge)
+				{
+					bool reliableConnection = true;
+
+					if (!currentAln.front().edge->nodeRight->isBifurcation() ||
+						!currentAln.back().edge->nodeLeft->isBifurcation()) reliableConnection = false;
+
+					if (currentAln.front().edge->resolved &&
+						currentAln.back().edge->resolved) reliableConnection = false;
+
+					if (currentAln.front().edge->rightLink ||
+						currentAln.back().edge->leftLink) reliableConnection = false;
+
+					if (!reliableConnection)
+					{
+						currentAln.clear();
+						currentAln.push_back(aln);
+						readStart = aln.overlap.curEnd + aln.overlap.extLen -
+									aln.overlap.extEnd;
+						readStart = std::min(readStart, aln.overlap.curLen - MAGIC_100);
+						continue;
+					}
+
+					int32_t flankScore = std::min(currentAln.front().overlap.curRange(),
+												  currentAln.back().overlap.curRange());
+					GraphPath currentPath;
+					for (auto& alnStep : currentAln) currentPath.push_back(alnStep.edge);
+					GraphPath complPathVec = _graph.complementPath(currentPath);
+
+					int32_t readEnd = aln.overlap.curBegin - aln.overlap.extBegin;
+
+					readEnd = std::max(readStart + MAGIC_100 - 1, readEnd);
+					if (readStart < 0 || readEnd >= aln.overlap.curLen)
+					{
+						Logger::get().warning()
+							<< "Something is wrong with bridging read sequence";
+						break;
+					}
+
+					ReadSequence readSeq = {aln.overlap.curId, readStart, readEnd};
+					ReadSequence complRead = {aln.overlap.curId.rc(),
+											  aln.overlap.curLen - readEnd - 1,
+											  aln.overlap.curLen - readStart - 1};
+					localConnections.push_back({currentPath, readSeq, flankScore});
+					localConnections.push_back({complPathVec, complRead, flankScore});
+
+					currentAln.clear();
+					currentAln.push_back(aln);
+					readStart = aln.overlap.curEnd + aln.overlap.extLen -
+								aln.overlap.extEnd;
+					readStart = std::min(readStart, aln.overlap.curLen - MAGIC_100);
+				}
 			}
 		}
-	}
 
-	return readConnections;
+		//merge into thread-specific bucket
+		static std::mutex mergeMtx;
+		std::lock_guard<std::mutex> lock(mergeMtx);
+		threadResults[0].insert(threadResults[0].end(),
+								localConnections.begin(), localConnections.end());
+	};
+
+	std::vector<std::thread> connThreads(std::min(numThreads,
+												   std::max((size_t)1, allAlignments.size())));
+	for (size_t i = 0; i < connThreads.size(); ++i)
+		connThreads[i] = std::thread(connectionWorker);
+	for (size_t i = 0; i < connThreads.size(); ++i)
+		connThreads[i].join();
+
+	return threadResults[0];
 }
 
 //cleans up the graph after repeat resolution
