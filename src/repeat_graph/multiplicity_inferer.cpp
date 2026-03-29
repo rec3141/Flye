@@ -7,6 +7,9 @@
 #include "../common/disjoint_set.h"
 #include "../common/utils.h"
 #include <cmath>
+#include <atomic>
+#include <thread>
+#include <mutex>
 
 
 
@@ -24,19 +27,59 @@ void MultiplicityInferer::estimateCoverage()
 		wndCoverage[edge].assign(numWindows, 0);
 	}
 
-	for (auto& path : _aligner.getAlignments())
+	//process alignments in parallel with per-thread coverage maps
+	auto& allAlignments = _aligner.getAlignments();
+	size_t numThreads = std::max((size_t)1, (size_t)Parameters::get().numThreads);
+	std::vector<std::unordered_map<GraphEdge*, std::vector<int32_t>>> threadCov(numThreads);
+
+	//pre-initialize thread-local maps with same structure
+	for (size_t t = 0; t < numThreads; ++t)
 	{
-		for (size_t pathId = 0; pathId < path.size(); ++pathId)
+		for (auto& edge : _graph.iterEdges())
 		{
-			auto& edgeCov = wndCoverage[path[pathId].edge];
-			int covFrom = std::max(0, path[pathId].overlap.extBegin / WINDOW + 1);
-			int covTo = std::min((int)edgeCov.size(), path[pathId].overlap.extEnd / WINDOW);
+			size_t numWindows = edge->length() / WINDOW;
+			threadCov[t][edge].assign(numWindows, 0);
+		}
+	}
 
-			//for intermediae alignments, cover the entire edge
-			if (pathId > 0) covFrom = 0;
-			if (pathId < path.size() - 1) covTo = edgeCov.size();
+	std::atomic<size_t> alnIdx(0);
+	auto covWorker = [&](size_t threadId)
+	{
+		auto& localCov = threadCov[threadId];
+		while (true)
+		{
+			size_t idx = alnIdx.fetch_add(1);
+			if (idx >= allAlignments.size()) return;
 
-			for (int i = covFrom; i < covTo; ++i) ++edgeCov[i];
+			auto& path = allAlignments[idx];
+			for (size_t pathId = 0; pathId < path.size(); ++pathId)
+			{
+				auto& edgeCov = localCov[path[pathId].edge];
+				int covFrom = std::max(0, path[pathId].overlap.extBegin / WINDOW + 1);
+				int covTo = std::min((int)edgeCov.size(), path[pathId].overlap.extEnd / WINDOW);
+
+				if (pathId > 0) covFrom = 0;
+				if (pathId < path.size() - 1) covTo = edgeCov.size();
+
+				for (int i = covFrom; i < covTo; ++i) ++edgeCov[i];
+			}
+		}
+	};
+	std::vector<std::thread> covThreads(std::min(numThreads,
+												  std::max((size_t)1, allAlignments.size())));
+	for (size_t i = 0; i < covThreads.size(); ++i)
+		covThreads[i] = std::thread(covWorker, i);
+	for (size_t i = 0; i < covThreads.size(); ++i)
+		covThreads[i].join();
+
+	//merge thread-local coverage into wndCoverage
+	for (size_t t = 0; t < numThreads; ++t)
+	{
+		for (auto& edgePair : threadCov[t])
+		{
+			auto& dst = wndCoverage[edgePair.first];
+			auto& src = edgePair.second;
+			for (size_t i = 0; i < src.size(); ++i) dst[i] += src[i];
 		}
 	}
 
@@ -271,21 +314,50 @@ int MultiplicityInferer::splitNodes()
 	Logger::get().debug() << "Splitting nodes";
 	int numSplit = 0;
 
-	//storing connectivity information
-	std::unordered_map<GraphEdge*, 
-					   std::unordered_map<GraphEdge*, int>> readSupport;
-	for (auto& readPath : _aligner.getAlignments())
-	{
-		if (readPath.size() < 2) continue;
-		
-		for (size_t i = 0; i < readPath.size() - 1; ++i)
-		{
-			//if (readPath[i].edge == readPath[i + 1].edge &&
-			//	readPath[i].edge->isLooped()) continue;
-			if (readPath[i].edge->edgeId == 
-				readPath[i + 1].edge->edgeId.rc()) continue;
+	//storing connectivity information — parallel accumulation
+	auto& allAlignments = _aligner.getAlignments();
+	size_t numThreads = std::max((size_t)1, (size_t)Parameters::get().numThreads);
+	typedef std::unordered_map<GraphEdge*, std::unordered_map<GraphEdge*, int>> SupportMap;
+	std::vector<SupportMap> threadSupport(numThreads);
 
-			++readSupport[readPath[i].edge][readPath[i + 1].edge];
+	std::atomic<size_t> supportIdx(0);
+	auto supportWorker = [&](size_t threadId)
+	{
+		auto& localSupport = threadSupport[threadId];
+		while (true)
+		{
+			size_t idx = supportIdx.fetch_add(1);
+			if (idx >= allAlignments.size()) return;
+
+			auto& readPath = allAlignments[idx];
+			if (readPath.size() < 2) continue;
+
+			for (size_t i = 0; i < readPath.size() - 1; ++i)
+			{
+				if (readPath[i].edge->edgeId ==
+					readPath[i + 1].edge->edgeId.rc()) continue;
+
+				++localSupport[readPath[i].edge][readPath[i + 1].edge];
+			}
+		}
+	};
+	std::vector<std::thread> supportThreads(std::min(numThreads,
+													  std::max((size_t)1, allAlignments.size())));
+	for (size_t i = 0; i < supportThreads.size(); ++i)
+		supportThreads[i] = std::thread(supportWorker, i);
+	for (size_t i = 0; i < supportThreads.size(); ++i)
+		supportThreads[i].join();
+
+	//merge thread-local support maps
+	SupportMap readSupport;
+	for (size_t t = 0; t < numThreads; ++t)
+	{
+		for (auto& edgePair : threadSupport[t])
+		{
+			for (auto& innerPair : edgePair.second)
+			{
+				readSupport[edgePair.first][innerPair.first] += innerPair.second;
+			}
 		}
 	}
 
