@@ -76,37 +76,46 @@ void BubbleProcessor::parallelWorker()
 {
 	const int MAX_BUBBLE = 5000;
 
-	_stateMutex.lock();
 	while (true)
 	{
-		if (_cachedBubbles.empty())
+		//grab a batch of bubbles under the lock
+		std::vector<Bubble> batch;
 		{
-			this->cacheBubbles(BUBBLES_CACHE);
-			if(_cachedBubbles.empty())
+			std::lock_guard<std::mutex> lock(_stateMutex);
+			if (_cachedBubbles.empty())
 			{
-				_stateMutex.unlock();
-				return;
+				this->cacheBubbles(BUBBLES_CACHE);
+				if (_cachedBubbles.empty()) return;
+			}
+
+			int toGrab = std::min(BATCH_SIZE, (int)_cachedBubbles.size());
+			batch.assign(std::make_move_iterator(_cachedBubbles.end() - toGrab),
+						 std::make_move_iterator(_cachedBubbles.end()));
+			_cachedBubbles.erase(_cachedBubbles.end() - toGrab,
+								 _cachedBubbles.end());
+		}
+
+		//process entire batch without holding the lock
+		for (auto& bubble : batch)
+		{
+			if (bubble.candidate.size() < MAX_BUBBLE &&
+				bubble.branches.size() > 1)
+			{
+				_generalPolisher.polishBubble(bubble);
+				if (_hopoEnabled)
+				{
+					_homoPolisher.polishBubble(bubble);
+				}
+				_dinucFixer.fixBubble(bubble);
 			}
 		}
 
-		Bubble bubble = _cachedBubbles.back();
-		_cachedBubbles.pop_back();
-
-		if (bubble.candidate.size() < MAX_BUBBLE &&
-			bubble.branches.size() > 1)
+		//write all results at once under the lock
 		{
-			_stateMutex.unlock();
-			_generalPolisher.polishBubble(bubble);
-			if (_hopoEnabled)
-			{
-				_homoPolisher.polishBubble(bubble);
-			}
-			_dinucFixer.fixBubble(bubble);
-			_stateMutex.lock();
+			std::lock_guard<std::mutex> lock(_stateMutex);
+			this->writeBubbles(batch);
+			if (_verbose) this->writeLog(batch);
 		}
-		
-		this->writeBubbles({bubble});
-		if (_verbose) this->writeLog({bubble});
 	}
 }
 

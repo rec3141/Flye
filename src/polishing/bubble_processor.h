@@ -35,7 +35,8 @@ private:
 	void writeBubbles(const std::vector<Bubble>& bubbles);
 	void writeLog(const std::vector<Bubble>& bubbles);
 
-	const int BUBBLES_CACHE = 100;
+	const int BUBBLES_CACHE = 1000;
+	const int BATCH_SIZE = 20;
 
 	bool					  _verbose;
 	bool 					  _showProgress;
