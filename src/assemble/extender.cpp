@@ -306,40 +306,46 @@ void Extender::assembleDisjointigs()
 		//Good to go!
 		ExtensionInfo exInfo = this->extendDisjointig(startRead);
 
-		//Exclusive part - updating the overall assembly
-		std::lock_guard<std::mutex> guard(indexMutex);
-
-		/*if (exInfo.reads.size() - exInfo.numSuspicious < 
-			(size_t)Config::get("min_reads_in_disjointig"))
-		{
-			//Logger::get().debug() << "Thrown away: " << exInfo.reads.size() << " " << exInfo.numSuspicious
-			//	<< " " << exInfo.leftTip << " " << exInfo.rightTip;
-			return;
-		}*/
-		
+		//--- Pre-lock: inner count check (uses concurrent hash map, no lock needed) ---
 		int innerCount = 0;
-		//do not count first and last reads - they are inner by defalut
 		for (size_t i = 1; i < exInfo.reads.size() - 1; ++i)
 		{
 			if (_innerReads.contains(exInfo.reads[i])) ++innerCount;
 		}
 		int innerThreshold = std::min((int)Config::get("max_inner_reads"),
-									  int((float)Config::get("max_inner_fraction") * 
+									  int((float)Config::get("max_inner_fraction") *
 										  exInfo.reads.size()));
 		if (innerCount > innerThreshold)
 		{
+			std::lock_guard<std::mutex> guard(indexMutex);
 			Logger::get().debug() << "Discarded disjointig with "
 				<< exInfo.reads.size() << " reads and "
 				<< innerCount << " inner overlaps";
 			return;
 		}
 
-		Logger::get().debug() << "Assembled disjointig " 
+		//--- Pre-lock: collect overlaps and compute inner reads (EXPENSIVE) ---
+		//lazySeqOverlaps uses concurrent hash map internally, thread-safe
+		//getInnerReads is a pure function with no side effects
+		std::vector<OverlapRange> allOverlaps;
+		for (const auto& readId : exInfo.reads)
+		{
+			for (const auto& ovlp : IterNoOverhang(_ovlpContainer.lazySeqOverlaps(readId)))
+			{
+				allOverlaps.push_back(ovlp);
+			}
+		}
+		auto innerReads = this->getInnerReads(allOverlaps);
+
+		//--- Lock: only fast hash map inserts and bookkeeping ---
+		std::lock_guard<std::mutex> guard(indexMutex);
+
+		Logger::get().debug() << "Assembled disjointig "
 			<< std::to_string(_readLists.size() + 1)
 			<< "\n\tWith " << exInfo.reads.size() << " reads"
 			<< "\n\tStart read: " << _readsContainer.seqName(startRead)
 			<< "\n\tAt position: " << exInfo.stepsToTurn
-			<< "\n\tleftTip: " << exInfo.leftTip 
+			<< "\n\tleftTip: " << exInfo.leftTip
 			<< " rightTip: " << exInfo.rightTip
 			<< "\n\tSuspicious: " << exInfo.numSuspicious
 			<< "\n\tShort ext: " << exInfo.shortExtensions
@@ -349,40 +355,32 @@ void Extender::assembleDisjointigs()
 			<< "\n\tInner reads: " << innerCount
 			<< "\n\tLength: " << exInfo.assembledLength;
 
-		//Logger::get().debug() << "Ovlp index size: " << _ovlpContainer.indexSize();
-		
-		//update inner read index
-		std::vector<OverlapRange> allOverlaps;
 		for (const auto& readId : exInfo.reads)
 		{
 			coveredReads.insert(readId, true);
 			coveredReads.insert(readId.rc(), true);
 			_innerReads.insert(readId, true);
 			_innerReads.insert(readId.rc(), true);
-
-			for (const auto& ovlp : IterNoOverhang(_ovlpContainer.lazySeqOverlaps(readId)))
+		}
+		for (const auto& ovlp : allOverlaps)
+		{
+			if (ovlp.minRange() > _safeOverlap)
 			{
-				allOverlaps.push_back(ovlp);
-				if (ovlp.minRange() > _safeOverlap)
-				{
-					coveredReads.insert(ovlp.extId, true);
-					coveredReads.insert(ovlp.extId.rc(), true);
-				}
+				coveredReads.insert(ovlp.extId, true);
+				coveredReads.insert(ovlp.extId.rc(), true);
 			}
 		}
-
-		auto innerReads = this->getInnerReads(allOverlaps);
 		for (const auto& read : innerReads)
 		{
 			_innerReads.insert(read, true);
 			_innerReads.insert(read.rc(), true);
 		}
 
-		Logger::get().debug() << "Inner: " << 
+		Logger::get().debug() << "Inner: " <<
 			_innerReads.size() << " covered: " << coveredReads.size()
 			<< " total: "<< totalReads;
 		progress.setValue(coveredReads.size());
-		
+
 		_readLists.push_back(std::move(exInfo));
 	};
 
