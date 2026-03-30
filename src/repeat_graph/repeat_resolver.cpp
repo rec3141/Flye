@@ -734,112 +734,83 @@ std::vector<RepeatResolver::Connection>
 
 	const int32_t MAGIC_100 = 100;
 
-	//process read alignments in parallel, each read produces independent connections
+	//process read alignments serially — complementPath() accesses
+	//graph node pointers that are not safe for concurrent reads
+	//when graph structure may be changing between iterations
+	const int32_t MAGIC_100_LOCAL = MAGIC_100;
 	auto& allAlignments = _aligner.getAlignments();
-	size_t numThreads = std::max((size_t)1, (size_t)Parameters::get().numThreads);
-	std::vector<std::vector<Connection>> threadResults(numThreads);
-	std::atomic<size_t> readIdx(0);
-
-	auto connectionWorker = [&]()
+	std::vector<Connection> readConnections;
+	for (auto& readPath : allAlignments)
 	{
-		//determine thread index from first job
-		size_t myThread = 0;
-		for (size_t t = 0; t < numThreads; ++t)
+		GraphAlignment currentAln;
+		int32_t readStart = 0;
+		for (auto& aln : readPath)
 		{
-			if (std::this_thread::get_id() == std::thread::id()) break;
-		}
-		//use thread-local storage via index
-		std::vector<Connection> localConnections;
-
-		while (true)
-		{
-			size_t idx = readIdx.fetch_add(1);
-			if (idx >= allAlignments.size()) break;
-
-			auto& readPath = allAlignments[idx];
-			GraphAlignment currentAln;
-			int32_t readStart = 0;
-			for (auto& aln : readPath)
+			if (currentAln.empty())
 			{
-				if (currentAln.empty())
+				if (!safeEdge(aln.edge)) continue;
+				readStart = aln.overlap.curEnd + aln.overlap.extLen -
+							aln.overlap.extEnd;
+				readStart = std::min(readStart, aln.overlap.curLen - MAGIC_100_LOCAL);
+			}
+
+			currentAln.push_back(aln);
+			if (safeEdge(aln.edge) && currentAln.front().edge != aln.edge)
+			{
+				bool reliableConnection = true;
+
+				if (!currentAln.front().edge->nodeRight->isBifurcation() ||
+					!currentAln.back().edge->nodeLeft->isBifurcation()) reliableConnection = false;
+
+				if (currentAln.front().edge->resolved &&
+					currentAln.back().edge->resolved) reliableConnection = false;
+
+				if (currentAln.front().edge->rightLink ||
+					currentAln.back().edge->leftLink) reliableConnection = false;
+
+				if (!reliableConnection)
 				{
-					if (!safeEdge(aln.edge)) continue;
-					readStart = aln.overlap.curEnd + aln.overlap.extLen -
-								aln.overlap.extEnd;
-					readStart = std::min(readStart, aln.overlap.curLen - MAGIC_100);
-				}
-
-				currentAln.push_back(aln);
-				if (safeEdge(aln.edge) && currentAln.front().edge != aln.edge)
-				{
-					bool reliableConnection = true;
-
-					if (!currentAln.front().edge->nodeRight->isBifurcation() ||
-						!currentAln.back().edge->nodeLeft->isBifurcation()) reliableConnection = false;
-
-					if (currentAln.front().edge->resolved &&
-						currentAln.back().edge->resolved) reliableConnection = false;
-
-					if (currentAln.front().edge->rightLink ||
-						currentAln.back().edge->leftLink) reliableConnection = false;
-
-					if (!reliableConnection)
-					{
-						currentAln.clear();
-						currentAln.push_back(aln);
-						readStart = aln.overlap.curEnd + aln.overlap.extLen -
-									aln.overlap.extEnd;
-						readStart = std::min(readStart, aln.overlap.curLen - MAGIC_100);
-						continue;
-					}
-
-					int32_t flankScore = std::min(currentAln.front().overlap.curRange(),
-												  currentAln.back().overlap.curRange());
-					GraphPath currentPath;
-					for (auto& alnStep : currentAln) currentPath.push_back(alnStep.edge);
-					GraphPath complPathVec = _graph.complementPath(currentPath);
-
-					int32_t readEnd = aln.overlap.curBegin - aln.overlap.extBegin;
-
-					readEnd = std::max(readStart + MAGIC_100 - 1, readEnd);
-					if (readStart < 0 || readEnd >= aln.overlap.curLen)
-					{
-						Logger::get().warning()
-							<< "Something is wrong with bridging read sequence";
-						break;
-					}
-
-					ReadSequence readSeq = {aln.overlap.curId, readStart, readEnd};
-					ReadSequence complRead = {aln.overlap.curId.rc(),
-											  aln.overlap.curLen - readEnd - 1,
-											  aln.overlap.curLen - readStart - 1};
-					localConnections.push_back({currentPath, readSeq, flankScore});
-					localConnections.push_back({complPathVec, complRead, flankScore});
-
 					currentAln.clear();
 					currentAln.push_back(aln);
 					readStart = aln.overlap.curEnd + aln.overlap.extLen -
 								aln.overlap.extEnd;
-					readStart = std::min(readStart, aln.overlap.curLen - MAGIC_100);
+					readStart = std::min(readStart, aln.overlap.curLen - MAGIC_100_LOCAL);
+					continue;
 				}
+
+				int32_t flankScore = std::min(currentAln.front().overlap.curRange(),
+											  currentAln.back().overlap.curRange());
+				GraphPath currentPath;
+				for (auto& alnStep : currentAln) currentPath.push_back(alnStep.edge);
+				GraphPath complPath = _graph.complementPath(currentPath);
+
+				int32_t readEnd = aln.overlap.curBegin - aln.overlap.extBegin;
+
+				readEnd = std::max(readStart + MAGIC_100_LOCAL - 1, readEnd);
+				if (readStart < 0 || readEnd >= aln.overlap.curLen)
+				{
+					Logger::get().warning()
+						<< "Something is wrong with bridging read sequence";
+					break;
+				}
+
+				ReadSequence readSeq = {aln.overlap.curId, readStart, readEnd};
+				ReadSequence complRead = {aln.overlap.curId.rc(),
+										  aln.overlap.curLen - readEnd - 1,
+										  aln.overlap.curLen - readStart - 1};
+				readConnections.push_back({currentPath, readSeq, flankScore});
+				readConnections.push_back({complPath, complRead, flankScore});
+
+				currentAln.clear();
+				currentAln.push_back(aln);
+				readStart = aln.overlap.curEnd + aln.overlap.extLen -
+							aln.overlap.extEnd;
+				readStart = std::min(readStart, aln.overlap.curLen - MAGIC_100_LOCAL);
 			}
 		}
+	}
 
-		//merge into thread-specific bucket
-		static std::mutex mergeMtx;
-		std::lock_guard<std::mutex> lock(mergeMtx);
-		threadResults[0].insert(threadResults[0].end(),
-								localConnections.begin(), localConnections.end());
-	};
-
-	std::vector<std::thread> connThreads(std::min(numThreads,
-												   std::max((size_t)1, allAlignments.size())));
-	for (size_t i = 0; i < connThreads.size(); ++i)
-		connThreads[i] = std::thread(connectionWorker);
-	for (size_t i = 0; i < connThreads.size(); ++i)
-		connThreads[i].join();
-
-	return threadResults[0];
+	return readConnections;
 }
 
 //cleans up the graph after repeat resolution
