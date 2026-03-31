@@ -467,80 +467,61 @@ void RepeatResolver::findRepeats()
 	};
 
 	//first simpler conditions without read alignment
-	//collect forward-strand path indices for parallel processing
-	std::vector<size_t> fwdPathIdx;
-	for (size_t i = 0; i < unbranchingPaths.size(); ++i)
+	for (auto& path : unbranchingPaths)
 	{
-		if (unbranchingPaths[i].id.strand()) fwdPathIdx.push_back(i);
-	}
+		if (!path.id.strand()) continue;
 
-	//parallel classification: each path is checked independently
-	//results stored per-path to avoid races on edge->repetitive
-	enum RepeatReason { NONE, HIGH_COV, SHORT_LOOP, SELF_COMPL, HAPLO_EDGE, TANDEM };
-	std::vector<RepeatReason> pathReasons(fwdPathIdx.size(), NONE);
-
-	std::atomic<size_t> convergenceIdx(0);
-	size_t numThreads = std::max((size_t)1, (size_t)Parameters::get().numThreads);
-	auto classifyWorker = [&]()
-	{
-		while (true)
+		//mark paths with high coverage as repetitive
+		if (!Parameters::get().unevenCoverage &&
+			path.meanCoverage > _multInf.getUniqueCovThreshold())
 		{
-			size_t idx = convergenceIdx.fetch_add(1);
-			if (idx >= fwdPathIdx.size()) return;
+			markRepetitive(&path);
+			markRepetitive(complPath(&path));
+			Logger::get().debug() << "High-cov: "
+				<< path.edgesStr() << "\t" << path.length << "\t"
+				<< path.meanCoverage;
+		}
 
-			auto& path = unbranchingPaths[fwdPathIdx[idx]];
+		const int MIN_RELIABLE_LOOP = 5000;
+		if (path.isLooped() && path.length < MIN_RELIABLE_LOOP)
+		{
+			markRepetitive(&path);
+			markRepetitive(complPath(&path));
+			Logger::get().debug() << "Short-loop: " << path.edgesStr();
+		}
 
-			if (!Parameters::get().unevenCoverage &&
-				path.meanCoverage > _multInf.getUniqueCovThreshold())
+		for (auto& edge : path.path)
+		{
+			if (edge->selfComplement)
 			{
-				pathReasons[idx] = HIGH_COV;
-				return;
-			}
-
-			const int MIN_RELIABLE_LOOP = 5000;
-			if (path.isLooped() && path.length < MIN_RELIABLE_LOOP)
-			{
-				pathReasons[idx] = SHORT_LOOP;
-				return;
-			}
-
-			for (auto& edge : path.path)
-			{
-				if (edge->selfComplement) { pathReasons[idx] = SELF_COMPL; return; }
-			}
-			for (auto& edge : path.path)
-			{
-				if (edge->altHaplotype) { pathReasons[idx] = HAPLO_EDGE; return; }
-			}
-
-			//tandem copy check is the expensive part (queries read alignments)
-			for (auto& edge : path.path)
-			{
-				if (!edge->repetitive && this->checkForTandemCopies(edge, alnIndex[edge]))
-				{
-					pathReasons[idx] = TANDEM;
-					return;
-				}
+				markRepetitive(&path);
+				markRepetitive(complPath(&path));
+				Logger::get().debug() << "Self-compl: " << path.edgesStr();
+				break;
 			}
 		}
-	};
-	std::vector<std::thread> classifyThreads(std::min(numThreads, fwdPathIdx.size()));
-	for (size_t i = 0; i < classifyThreads.size(); ++i)
-		classifyThreads[i] = std::thread(classifyWorker);
-	for (size_t i = 0; i < classifyThreads.size(); ++i)
-		classifyThreads[i].join();
 
-	//apply results serially (deterministic order, safe graph mutation)
-	const char* reasonStr[] = {"", "High-cov", "Short-loop", "Self-compl", "Haplo-edge", "Tandem"};
-	for (size_t idx = 0; idx < fwdPathIdx.size(); ++idx)
-	{
-		if (pathReasons[idx] == NONE) continue;
-		auto& path = unbranchingPaths[fwdPathIdx[idx]];
-		markRepetitive(&path);
-		markRepetitive(complPath(&path));
-		Logger::get().debug() << reasonStr[pathReasons[idx]] << ": "
-			<< path.edgesStr() << "\t" << path.length << "\t"
-			<< path.meanCoverage;
+		for (auto& edge : path.path)
+		{
+			if (edge->altHaplotype)
+			{
+				markRepetitive(&path);
+				markRepetitive(complPath(&path));
+				Logger::get().debug() << "Haplo-edge: " << path.edgesStr();
+				break;
+			}
+		}
+
+		for (auto& edge : path.path)
+		{
+			if (!edge->repetitive && this->checkForTandemCopies(edge, alnIndex[edge]))
+			{
+				markRepetitive(&path);
+				markRepetitive(complPath(&path));
+				Logger::get().debug() << "Tandem: " << path.edgesStr();
+				break;
+			}
+		}
 	}
 
 	//Finally, using the read alignments
