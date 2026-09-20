@@ -850,7 +850,8 @@ namespace
 	};
 	auto lowestPri = [](const EdgeWithPriority& e1, const EdgeWithPriority& e2)
 		{return e1.priority != e2.priority ? 
-				e1.priority > e2.priority : e1.edge > e2.edge;};
+				e1.priority > e2.priority : 
+				e2.edge->edgeId < e1.edge->edgeId;};	//id, not address
 
 	//runs dijskstra algorithm and returns shortest paths
 	//lengths from source to all edges. terminates
@@ -1010,11 +1011,20 @@ namespace
 				sb.start = startEdge;
 				sb.end = endCand;
 				sb.refPath = refPath;
+				//The scratch map is reused across candidates by this thread,
+				//so its iteration order depends on its history; insert the
+				//internal edges in id order so the bubble (and everything
+				//iterating internalEdges later) does not.
+				std::vector<GraphEdge*> internal;
 				for (auto& edgeDist : distancesFromSource.dist)
 				{
 					if (edgeDist.first != sb.start && 
-						edgeDist.first != sb.end) sb.internalEdges.insert(edgeDist.first);
+						edgeDist.first != sb.end) internal.push_back(edgeDist.first);
 				}
+				std::sort(internal.begin(), internal.end(),
+						  [](GraphEdge* e1, GraphEdge* e2)
+						  {return e1->edgeId < e2->edgeId;});
+				for (auto& edge : internal) sb.internalEdges.insert(edge);
 				//Logger::get().debug() << "Good end: " << sb.end->edgeId.signedId();
 				return sb;
 			}
