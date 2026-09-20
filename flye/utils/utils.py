@@ -4,12 +4,41 @@
 
 from __future__ import absolute_import
 import os
+import re
 import signal
+import subprocess
 import multiprocessing
 import logging
 
 
 logger = logging.getLogger()
+
+
+def resolve_samtools(min_version=(1, 10)):
+    """Prefer a samtools on PATH over the vendored one, when it is new enough.
+
+    Flye vendors samtools 1.9 (lib/samtools-1.9), which predates
+    `sort --write-index`, so a sorted BAM has to be indexed in a second pass.
+    On a 1.18M-contig metagenome that pass took 5h53m at the hardcoded -@ 4 --
+    about half the wall-clock of polishing, and far longer than the 52 min the
+    alignment itself needed.
+
+    Environments that ship a newer samtools (danaSeq pins >=1.17 in its flye
+    env) can index during sorting instead. Falls back to the vendored binary
+    when PATH has nothing suitable, so a plain `make`-built Flye still works.
+    """
+    for cand in ("samtools", "flye-samtools"):
+        if not which(cand):
+            continue
+        try:
+            out = subprocess.check_output([cand, "--version"],
+                                          stderr=subprocess.DEVNULL).decode()
+            nums = re.findall(r"\d+", out.splitlines()[0])
+            if tuple(int(x) for x in nums[:2]) >= min_version:
+                return cand
+        except (subprocess.CalledProcessError, OSError, IndexError, ValueError):
+            continue
+    return "flye-samtools"
 
 
 def which(program):
