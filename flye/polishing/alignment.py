@@ -16,7 +16,7 @@ import datetime
 from copy import copy
 
 import flye.utils.fasta_parser as fp
-from flye.utils.utils import which, get_median
+from flye.utils.utils import which, get_median, resolve_samtools
 from flye.utils.sam_parser import AlignmentException
 from flye.six import iteritems
 from flye.six.moves import range
@@ -24,7 +24,7 @@ from flye.six.moves import range
 
 logger = logging.getLogger()
 MINIMAP_BIN = "flye-minimap2"
-SAMTOOLS_BIN = "flye-samtools"
+SAMTOOLS_BIN = resolve_samtools()
 
 ContigInfo = namedtuple("ContigInfo", ["id", "length", "type"])
 
