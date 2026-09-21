@@ -165,13 +165,25 @@ class SynchonizedChunkManager(object):
     def is_done(self):
         return self.shared_eof.value
 
-    def get_chunk_batch(self, max_batch):
+    def get_chunk_batch(self, max_batch, max_bases=None):
         """
-        Returns up to max_batch regions. Only whole-contig regions are
+        Returns up to max_batch regions, stopping early once their combined
+        length would exceed max_bases. Only whole-contig regions are
         batched together; a contig split into multiple chunks is returned
-        alone, since a read may overlap two of its chunks
+        alone, since a read may overlap two of its chunks.
+
+        The bases budget keeps batches comparable in cost. Contigs are
+        emitted longest-first, so counting alone puts the most expensive
+        regions of the whole assembly into the first batch, which one
+        worker then processes while the others drain the cheap tail.
+
+        The default budget is chosen to fire only on that head: it is well
+        above a typical consensus batch (500 disjointigs of a few kb) and
+        far above a typical polishing batch (500 short contigs), so the
+        region-query amortisation is untouched in the common case.
         """
         batch = []
+        batch_bases = 0
         while len(batch) < max_batch:
             if self.shared_lock:
                 self.shared_lock.acquire()
@@ -183,10 +195,16 @@ class SynchonizedChunkManager(object):
                 whole_contig = self.whole_contig[job_id]
                 if batch and not whole_contig:
                     break
+                #always take at least one region, however long it is
+                region_bases = region.end - region.start
+                if (batch and max_bases is not None and
+                        batch_bases + region_bases > max_bases):
+                    break
                 self.shared_num_jobs.value = job_id + 1
                 if self.shared_num_jobs.value == len(self.fetch_list):
                     self.shared_eof.value = True
                 batch.append(region)
+                batch_bases += region_bases
                 if not whole_contig:
                     break
             finally:
