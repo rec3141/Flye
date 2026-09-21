@@ -14,36 +14,37 @@ import logging
 logger = logging.getLogger()
 
 
-def samtools_version(binary):
+def htslib_version(binary):
     """
-    Returns the samtools version as a tuple, or None
+    Returns the htslib version samtools is linked against, as a tuple, or None
+
+    `samtools --version` prints its own version first and the htslib it was
+    built against on the next line. The two are released together, but a
+    binary can be linked against a different htslib, and the behaviour that
+    matters for --write-index is htslib's.
     """
     try:
         out = subprocess.check_output([binary, "--version"],
                                       stderr=subprocess.DEVNULL).decode()
-        nums = re.findall(r"\d+", out.splitlines()[0])
-        return tuple(int(x) for x in nums[:2])
+        for line in out.splitlines():
+            if "htslib" in line.lower():
+                nums = re.findall(r"\d+", line)
+                return tuple(int(x) for x in nums[:2])
+        return None
     except (subprocess.CalledProcessError, OSError, IndexError, ValueError):
         return None
 
 
-def resolve_samtools(min_version=(1, 10)):
+def resolve_samtools(min_version=(1, 12)):
     """Prefer a samtools on PATH over the vendored one, when it is new enough.
 
-    Flye vendors samtools 1.9 (lib/samtools-1.9), which predates
-    `sort --write-index`, so a sorted BAM has to be indexed in a second pass.
-    On a 1.18M-contig metagenome that pass took 5h53m at the hardcoded -@ 4 --
-    about half the wall-clock of polishing, and far longer than the 52 min the
-    alignment itself needed.
-
-    Environments that ship a newer samtools (danaSeq pins >=1.17 in its flye
-    env) can index during sorting instead. Falls back to the vendored binary
-    when PATH has nothing suitable, so a plain `make`-built Flye still works.
+    htslib 1.12+ supports the write-index path used during polishing. Fall back
+    to the vendored binary when PATH has nothing suitable.
     """
     for cand in ("samtools", "flye-samtools"):
         if not which(cand):
             continue
-        ver = samtools_version(cand)
+        ver = htslib_version(cand)
         if ver is not None and ver >= min_version:
             return cand
     return "flye-samtools"
