@@ -62,7 +62,8 @@ def _thread_worker(aln_reader, chunk_feeder, contigs_info, err_mode,
     try:
         while True:
             #fetching regions in batches, to amortize bam header parsing
-            ctg_regions = chunk_feeder.get_chunk_batch(cfg.vals["bam_region_batch"])
+            ctg_regions = chunk_feeder.get_chunk_batch(cfg.vals["bam_region_batch"],
+                                                 cfg.vals["bam_region_batch_bases"])
             if not ctg_regions:
                 break
             batch_alns = aln_reader.get_alignments_batch(ctg_regions)

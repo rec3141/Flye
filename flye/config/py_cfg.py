@@ -39,6 +39,7 @@ vals = {
         "max_read_coverage" : 1000,
         #number of bam regions to read in a single samtools call
         "bam_region_batch" : 500,
+        "bam_region_batch_bases" : 8000000,
         "min_polish_aln_len" : 500,
 
         #final coverage filtering
