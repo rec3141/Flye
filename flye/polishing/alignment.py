@@ -16,7 +16,7 @@ import datetime
 from copy import copy
 
 import flye.utils.fasta_parser as fp
-from flye.utils.utils import which, get_median, resolve_samtools
+from flye.utils.utils import which, get_median, resolve_samtools, samtools_version
 from flye.utils.sam_parser import AlignmentException
 from flye.six import iteritems
 from flye.six.moves import range
@@ -25,6 +25,8 @@ from flye.six.moves import range
 logger = logging.getLogger()
 MINIMAP_BIN = "flye-minimap2"
 SAMTOOLS_BIN = resolve_samtools()
+#sort --write-index needs samtools 1.10+; the vendored 1.9 does not have it
+SAMTOOLS_WRITE_INDEX = (samtools_version(SAMTOOLS_BIN) or (0, 0)) >= (1, 10)
 
 ContigInfo = namedtuple("ContigInfo", ["id", "length", "type"])
 
@@ -228,7 +230,7 @@ def _run_minimap(reference_file, reads_files, num_proc, reads_type, out_file):
     #SAM_HEADER = "\'@PG|@HD|@SQ|@RG|@CO\'"
     work_dir = os.path.dirname(out_file)
     stderr_file = os.path.join(work_dir, "minimap.stderr")
-    SORT_THREADS = "4"
+    SORT_THREADS = str(min(num_proc, 16))
     SORT_MEM = "4G" if os.path.getsize(reference_file) > 100 * 1024 * 1024 else "1G"
     BATCH = "5G" if os.path.getsize(reference_file) > 100 * 1024 * 1024 else "1G"
 
@@ -265,7 +267,12 @@ def _run_minimap(reference_file, reads_files, num_proc, reads_type, out_file):
     cmdline.extend(["|", SAMTOOLS_BIN, "view", "-T", "'" + reference_file + "'", "-u", "-"])
     cmdline.extend(["|", SAMTOOLS_BIN, "sort", "-T", "'" + tmp_prefix + "'", "-O", "bam",
                     "-@", SORT_THREADS, "-l", "1", "-m", SORT_MEM])
-    cmdline.extend(["-o", "'" + out_file + "'"])
+    #indexing during the sort saves a second pass over the whole bam
+    if SAMTOOLS_WRITE_INDEX:
+        cmdline.extend(["--write-index",
+                        "-o", "'" + out_file + "##idx##" + out_file + ".csi'"])
+    else:
+        cmdline.extend(["-o", "'" + out_file + "'"])
 
     #logger.debug("Running: " + " ".join(cmdline))
     try:
@@ -274,7 +281,9 @@ def _run_minimap(reference_file, reads_files, num_proc, reads_type, out_file):
                               "set -eo pipefail; " + " ".join(cmdline)],
                               stderr=open(stderr_file, "w"),
                               stdout=open(os.devnull, "w"))
-        subprocess.check_call(SAMTOOLS_BIN + " index -c -@ 4 " + "'" + out_file + "'", shell=True)
+        if not SAMTOOLS_WRITE_INDEX:
+            subprocess.check_call(SAMTOOLS_BIN + " index -c -@ " + SORT_THREADS +
+                                  " '" + out_file + "'", shell=True)
         #os.remove(stderr_file)
 
     except (subprocess.CalledProcessError, OSError) as e:

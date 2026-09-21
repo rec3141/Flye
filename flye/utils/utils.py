@@ -14,6 +14,19 @@ import logging
 logger = logging.getLogger()
 
 
+def samtools_version(binary):
+    """
+    Returns the samtools version as a tuple, or None
+    """
+    try:
+        out = subprocess.check_output([binary, "--version"],
+                                      stderr=subprocess.DEVNULL).decode()
+        nums = re.findall(r"\d+", out.splitlines()[0])
+        return tuple(int(x) for x in nums[:2])
+    except (subprocess.CalledProcessError, OSError, IndexError, ValueError):
+        return None
+
+
 def resolve_samtools(min_version=(1, 10)):
     """Prefer a samtools on PATH over the vendored one, when it is new enough.
 
@@ -30,14 +43,9 @@ def resolve_samtools(min_version=(1, 10)):
     for cand in ("samtools", "flye-samtools"):
         if not which(cand):
             continue
-        try:
-            out = subprocess.check_output([cand, "--version"],
-                                          stderr=subprocess.DEVNULL).decode()
-            nums = re.findall(r"\d+", out.splitlines()[0])
-            if tuple(int(x) for x in nums[:2]) >= min_version:
-                return cand
-        except (subprocess.CalledProcessError, OSError, IndexError, ValueError):
-            continue
+        ver = samtools_version(cand)
+        if ver is not None and ver >= min_version:
+            return cand
     return "flye-samtools"
 
 
