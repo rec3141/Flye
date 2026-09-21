@@ -164,13 +164,18 @@ class SynchonizedChunkManager(object):
     def is_done(self):
         return self.shared_eof.value
 
-    def get_chunk_batch(self, max_batch):
+    def get_chunk_batch(self, max_batch, max_bases=None):
         """
-        Returns up to max_batch regions. Only whole-contig regions are
+        Returns up to max_batch regions, stopping early once their combined
+        length would exceed max_bases. Only whole-contig regions are
         batched together; a contig split into multiple chunks is returned
-        alone, since a read may overlap two of its chunks
+        alone, since a read may overlap two of its chunks.
+
+        The bases budget prevents one worker from receiving a disproportionate
+        amount of sequence when contigs are ordered longest-first.
         """
         batch = []
+        batch_bases = 0
         while len(batch) < max_batch:
             if self.shared_lock:
                 self.shared_lock.acquire()
@@ -182,10 +187,16 @@ class SynchonizedChunkManager(object):
                 whole_contig = self.whole_contig[job_id]
                 if batch and not whole_contig:
                     break
+                #always take at least one region, however long it is
+                region_bases = region.end - region.start
+                if (batch and max_bases is not None and
+                        batch_bases + region_bases > max_bases):
+                    break
                 self.shared_num_jobs.value = job_id + 1
                 if self.shared_num_jobs.value == len(self.fetch_list):
                     self.shared_eof.value = True
                 batch.append(region)
+                batch_bases += region_bases
                 if not whole_contig:
                     break
             finally:

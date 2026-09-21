@@ -61,12 +61,13 @@ def _thread_worker(aln_reader, chunk_feeder, contigs_info, err_mode,
     """
     try:
         while True:
-            #fetching regions in batches, to amortize bam header parsing
-            ctg_regions = chunk_feeder.get_chunk_batch(cfg.vals["bam_region_batch"])
+            #fetch regions in batches to amortize BAM header parsing
+            ctg_regions = chunk_feeder.get_chunk_batch(cfg.vals["bam_region_batch"],
+                                                       cfg.vals["bam_region_batch_bases"])
             if not ctg_regions:
                 break
             batch_alns = aln_reader.get_alignments_batch(ctg_regions)
-            
+
             for ctg_region in ctg_regions:
                 ctg_aln = batch_alns.get(ctg_region.ctg_id, [])
                 ctg_id = ctg_region.ctg_id
@@ -105,7 +106,7 @@ def _thread_worker(aln_reader, chunk_feeder, contigs_info, err_mode,
                 results_queue.put((ctg_id, len(ctg_bubbles), num_long_bubbles,
                                    num_empty, num_long_branch, aln_errors,
                                    mean_cov))
-            
+
                 if bubbles_file_lock:
                     bubbles_file_lock.release()
 
