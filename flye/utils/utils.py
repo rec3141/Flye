@@ -27,7 +27,28 @@ def samtools_version(binary):
         return None
 
 
-def resolve_samtools(min_version=(1, 10)):
+def htslib_version(binary):
+    """
+    Returns the htslib version samtools is linked against, as a tuple, or None
+
+    `samtools --version` prints its own version first and the htslib it was
+    built against on the next line. The two are released together, but a
+    binary can be linked against a different htslib, and the behaviour that
+    matters for --write-index is htslib's.
+    """
+    try:
+        out = subprocess.check_output([binary, "--version"],
+                                      stderr=subprocess.DEVNULL).decode()
+        for line in out.splitlines():
+            if "htslib" in line.lower():
+                nums = re.findall(r"\d+", line)
+                return tuple(int(x) for x in nums[:2])
+        return None
+    except (subprocess.CalledProcessError, OSError, IndexError, ValueError):
+        return None
+
+
+def resolve_samtools(min_version=(1, 12)):
     """Prefer a samtools on PATH over the vendored one, when it is new enough.
 
     Flye vendors samtools 1.9 (lib/samtools-1.9), which predates
@@ -39,11 +60,14 @@ def resolve_samtools(min_version=(1, 10)):
     Environments that ship a newer samtools (danaSeq pins >=1.17 in its flye
     env) can index during sorting instead. Falls back to the vendored binary
     when PATH has nothing suitable, so a plain `make`-built Flye still works.
+
+    Requires htslib 1.12+, not 1.10: see the SAMTOOLS_WRITE_INDEX comment in
+    polishing/alignment.py. Older htslib falls back to the second pass.
     """
     for cand in ("samtools", "flye-samtools"):
         if not which(cand):
             continue
-        ver = samtools_version(cand)
+        ver = htslib_version(cand)
         if ver is not None and ver >= min_version:
             return cand
     return "flye-samtools"
