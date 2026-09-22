@@ -16,7 +16,7 @@ ifeq ($(shell uname -m),arm64)
 	export aarch64=1
 endif
 
-.PHONY: clean all profile debug minimap2 samtools
+.PHONY: clean all profile debug minimap2 samtools test
 
 .DEFAULT_GOAL := all
 
@@ -36,6 +36,13 @@ ${BIN_DIR}/flye-samtools:
 
 all: minimap2 samtools
 	make release -C src -j ${THREADS}
+test: all
+	bash tests/run_tip_pruning.sh
+	bash tests/run_seed_coverage.sh
+	bash tests/run_seed_assembly.sh
+	bash tests/run_contained_disjointigs.sh
+	bash tests/run_chimera_strands.sh
+	bash tests/run_overlap_cache.sh
 profile: minimap2 samtools
 	make profile -C src -j ${THREADS}
 debug: minimap2 samtools
