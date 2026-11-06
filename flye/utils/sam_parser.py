@@ -257,14 +257,32 @@ class SynchronizedSamReader(object):
         self.use_secondary = use_secondary
         self.cigar_parser = re.compile(b"[0-9]+[MIDNSHP=X]")
 
-        #self.shared_manager = multiprocessing.Manager()
-        self.ref_fasta = dict() if multiproc_manager == None else multiproc_manager.dict()
+        #The reference is read-only from here on. Forked workers share a plain
+        #dict copy-on-write. Other start methods pickle the reader into every
+        #worker, so there the sequences stay in the manager process instead.
+        def new_dict():
+            if (multiproc_manager is None or
+                    multiprocessing.get_start_method() == "fork"):
+                return {}
+            return multiproc_manager.dict()
+
+        #ref_fasta is uppercase, as _parse_cigar compares it with reads.
+        #ref_fasta_cased keeps the input sequence of contigs that are not
+        #uppercase already (e.g. soft-masked), for get_region_sequence().
+        self.ref_fasta = new_dict()
+        self.ref_fasta_cased = new_dict()
         for (h, s) in iteritems(reference_fasta):
-            self.ref_fasta[_BYTES(h)] = _BYTES(s)
+            seq = _BYTES(s)
+            seq_upper = seq.upper()
+            self.ref_fasta[_BYTES(h)] = seq_upper
+            if seq_upper != seq:
+                self.ref_fasta_cased[_BYTES(h)] = seq
 
     def get_region_sequence(self, region_id, region_start=None, region_end=None):
         parsed_contig = _BYTES(region_id)
-        contig_str = self.ref_fasta[parsed_contig]
+        contig_str = self.ref_fasta_cased.get(parsed_contig)
+        if contig_str is None:
+            contig_str = self.ref_fasta[parsed_contig]
         if region_start is None:
             region_start = 0
         if region_end is None:
@@ -273,7 +291,7 @@ class SynchronizedSamReader(object):
         return _STR(contig_str[region_start:region_end])
 
     def _parse_cigar(self, cigar_str, read_str, ctg_str, ctg_pos):
-        #ctg_str = self.ref_fasta[ctg_name]
+        read_str = read_str.upper()
         trg_seq = []
         qry_seq = []
         trg_start = ctg_pos - 1
@@ -287,6 +305,9 @@ class SynchronizedSamReader(object):
         hard_clipped_right = 0
         soft_clipped_left = 0
         soft_clipped_right = 0
+        matches = 0
+        total_len = 0
+        from_bytes = int.from_bytes
         for token in self.cigar_parser.findall(cigar_str):
             size, op = int(token[:-1]), token[-1:]
             if op == b"H":
@@ -302,18 +323,30 @@ class SynchronizedSamReader(object):
                 else:
                     soft_clipped_right += size
             elif op in b"MX=":
-                qry_seq.append(read_str[qry_pos : qry_pos + size].upper())
-                trg_seq.append(ctg_str[trg_pos : trg_pos + size].upper())
+                q_seg = read_str[qry_pos : qry_pos + size]
+                t_seg = ctg_str[trg_pos : trg_pos + size]
+                qry_seq.append(q_seg)
+                trg_seq.append(t_seg)
                 qry_pos += size
                 trg_pos += size
+                total_len += size
+                if q_seg == t_seg:
+                    matches += size
+                else:
+                    x = from_bytes(q_seg, "little") ^ from_bytes(t_seg, "little")
+                    m = from_bytes(b"\x7f" * size, "little")
+                    mismatches = bin((x + m) & ~m).count("1")
+                    matches += size - mismatches
             elif op == b"I":
-                qry_seq.append(read_str[qry_pos : qry_pos + size].upper())
+                qry_seq.append(read_str[qry_pos : qry_pos + size])
                 trg_seq.append(b"-" * size)
                 qry_pos += size
+                total_len += size
             elif op == b"D":
                 qry_seq.append(b"-" * size)
-                trg_seq.append(ctg_str[trg_pos : trg_pos + size].upper())
+                trg_seq.append(ctg_str[trg_pos : trg_pos + size])
                 trg_pos += size
+                total_len += size
             else:
                 raise AlignmentException("Unsupported CIGAR operation: " + str(op))
             left_hard = False
@@ -322,11 +355,7 @@ class SynchronizedSamReader(object):
 
         trg_seq = b"".join(trg_seq)
         qry_seq = b"".join(qry_seq)
-        matches = 0
-        for i in range(len(trg_seq)):
-            if trg_seq[i] == qry_seq[i]:
-                matches += 1
-        err_rate = 1 - matches / len(trg_seq)
+        err_rate = 1 - matches / total_len
 
         trg_end = trg_pos
         qry_end = qry_pos + hard_clipped_left
