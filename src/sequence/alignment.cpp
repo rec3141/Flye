@@ -262,12 +262,15 @@ float getAlignmentErrEdlib(const OverlapRange& ovlp, const DnaSequence& trgSeq,
 							 &trgCompressed.seq.str().c_str()[0], trgCompressed.seq.length(), 
 							 edlibCfg);
 	//Logger::get().debug() << result.editDistance << " " << result.alignmentLength;
-	if (result.editDistance < 0)
+	//edlibAlign allocates the end locations even for EDLIB_TASK_DISTANCE
+	const int editDistance = result.editDistance;
+	edlibFreeAlignResult(result);
+	if (editDistance < 0)
 	{
 		return 1.0f;
 	}
-	return (float)result.editDistance / std::max(qryCompressed.seq.length(), 
-												 trgCompressed.seq.length());
+	return (float)editDistance / std::max(qryCompressed.seq.length(), 
+										  trgCompressed.seq.length());
 	//return (float)result.editDistance / result.alignmentLength;
 }
 
