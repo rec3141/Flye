@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <queue>
 #include <cmath>
+#include <cstdlib>
+#include <thread>
 
 #include "vertex_index.h"
 #include "../common/logger.h"
@@ -430,12 +432,48 @@ void KmerCounter::count(bool useFlatCounter)
 	Logger::get().debug() << "Updating k-mer histogram";
 	if (_useFlatCounter)
 	{
-		for (size_t kmerId = 0; kmerId < COUNTER_LEN * 2; ++kmerId)
+		//Same histogram as calling getFreq() for every k-mer id, split across
+		//threads. Each byte holds two 4-bit counts (k-mer ids 2*pos and 2*pos+1).
+		//Empty bytes are skipped; saturated counts (15) still go through getFreq(),
+		//which adds the hash counter. std::map ignores insertion order, so summing
+		//the per-thread histograms gives the identical map.
+		const size_t numThreads = std::max(1, (int)Parameters::get().numThreads);
+		std::vector<KmerDistribution> partial(numThreads);
+		auto histWorker = [this, numThreads, &partial](size_t threadId)
 		{
-			Kmer kmer(kmerId);
-			size_t freq = this->getFreq(kmer);
-			if (freq > 0) _kmerDistribution[freq] += 1;
-			//if (kmerId % 1000000 == 0) Logger::get().debug() << kmerId << " " << freq;
+			size_t smallCounts[15] = {0};
+			KmerDistribution& hist = partial[threadId];
+			const size_t chunk = (COUNTER_LEN + numThreads - 1) / numThreads;
+			const size_t begin = std::min(COUNTER_LEN, threadId * chunk);
+			const size_t end = std::min(COUNTER_LEN, begin + chunk);
+			for (size_t pos = begin; pos < end; ++pos)
+			{
+				uint8_t bits = _flatCounter[pos].load(std::memory_order_relaxed);
+				if (bits == 0) continue;
+				for (size_t highBits = 0; highBits < 2; ++highBits)
+				{
+					uint8_t count = highBits ? (bits >> 4) : (bits & 15);
+					if (count < 15)
+					{
+						++smallCounts[count];
+					}
+					else
+					{
+						hist[this->getFreq(Kmer(pos * 2 + highBits))] += 1;
+					}
+				}
+			}
+			for (size_t c = 1; c < 15; ++c)
+			{
+				if (smallCounts[c] > 0) hist[c] += smallCounts[c];
+			}
+		};
+		std::vector<std::thread> workers;
+		for (size_t t = 0; t < numThreads; ++t) workers.emplace_back(histWorker, t);
+		for (auto& w : workers) w.join();
+		for (const auto& hist : partial)
+		{
+			for (const auto& freqCount : hist) _kmerDistribution[freqCount.first] += freqCount.second;
 		}
 	}
 	else
@@ -451,8 +489,14 @@ void KmerCounter::count(bool useFlatCounter)
 
 	Logger::get().debug() << "Hash size: " << _hashCounter.size();
 	Logger::get().debug() << "Total k-mers " << _numKmers;
-}
 
+	//From here until clear(), _frozenHash holds every lock of _hashCounter
+	//so that getFreq() can read it without locking. Until then, do not call
+	//upsert(), find() or any other locking method on _hashCounter itself:
+	//the call would wait forever on a lock that is already held.
+	_frozenHash.reset(new cuckoohash_map<Kmer, size_t>::locked_table(
+						_hashCounter.lock_table()));
+}
 
 size_t KmerCounter::getFreq(Kmer kmer) const
 {
@@ -475,12 +519,21 @@ size_t KmerCounter::getFreq(Kmer kmer) const
 	}
 
 	size_t freq = 0;
-	_hashCounter.find(kmer, freq);
+	if (_frozenHash)
+	{
+		auto it = _frozenHash->find(kmer);	//no locks: all are held by _frozenHash
+		if (it != _frozenHash->end()) freq = it->second;
+	}
+	else
+	{
+		_hashCounter.find(kmer, freq);
+	}
 	return freq + addCount;
 }
 
 void KmerCounter::clear()
 {
+	_frozenHash.reset();	//release the locks before clearing
 	_hashCounter.clear();
 	_hashCounter.reserve(0);
 	if (_flatCounter)
