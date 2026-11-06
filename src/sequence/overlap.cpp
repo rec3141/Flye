@@ -124,6 +124,11 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 	thread_local std::vector<KmerMatch> matchesList;
 	thread_local std::vector<int32_t> scoreTable;
 	thread_local std::vector<int32_t> backtrackTable;
+	thread_local std::vector<int32_t> primPos;
+	thread_local std::vector<int32_t> blockOf;
+	thread_local std::vector<int32_t> blockStart;
+	thread_local std::vector<int32_t> blockIdx;
+	thread_local std::vector<int32_t> blockFill;
 
 	static ChunkPool<KmerMatch> sharedChunkPool;	//shared accoress threads
 	BFContainer<KmerMatch> vecMatches(sharedChunkPool);
@@ -171,6 +176,9 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 		shrinkAndClear(matchesList, 2);
 		shrinkAndClear(scoreTable, 2);
 		shrinkAndClear(backtrackTable, 2);
+		shrinkAndClear(primPos, 2);
+		shrinkAndClear(blockOf, 2);
+		shrinkAndClear(blockIdx, 2);
 	}
 	timeMemory += std::chrono::duration_cast<std::chrono::duration<float>>
 						(std::chrono::system_clock::now() - timeStart).count();
@@ -278,47 +286,90 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 					  {return k1.extPos < k2.extPos;});
 		}
 
-		for (int32_t i = 1; i < (int32_t)scoreTable.size(); ++i)
+		//Tries to extend a chain ending at match j with match i.
+		//Returns true if the scan for predecessors of i should stop.
+		auto tryPredecessor = [&](int32_t i, int32_t j,
+								  int32_t& maxScore, int32_t& maxId)
+		{
+			int32_t curNext = matchesList[i].curPos;
+			int32_t extNext = matchesList[i].extPos;
+			int32_t curPrev = matchesList[j].curPos;
+			int32_t extPrev = matchesList[j].extPos;
+			int32_t jumpDiv = abs((curNext - curPrev) -
+								  (extNext - extPrev));
+			if (0 < curNext - curPrev && curNext - curPrev < _maxJump &&
+				0 < extNext - extPrev && extNext - extPrev < _maxJump &&
+				jumpDiv <= MAX_GAP)
+			{
+				int32_t matchScore =
+					std::min(std::min(curNext - curPrev, extNext - extPrev),
+									  kmerSize);
+				//int32_t gapCost = jumpDiv ?
+				//		kmerSize * jumpDiv + ilog2_32(jumpDiv) : 0;
+				int32_t gapCost = (jumpDiv > GAP_JUMP_THLD ? LG_GAP : SM_GAP) * jumpDiv;
+				int32_t nextScore = scoreTable[j] + matchScore - gapCost;
+				if (nextScore > maxScore)
+				{
+					maxScore = nextScore;
+					maxId = j;
+
+					if (jumpDiv == 0 && curNext - curPrev < kmerSize) return true;
+				}
+			}
+			return false;
+		};
+
+		//A valid predecessor j < i is within _maxJump of i on both sequences.
+		//Matches are sorted by one coordinate (prim); they are also bucketed
+		//by the other (sec) in blocks of _maxJump, so only the block of i
+		//and the one before can hold a valid j. The two blocks are merged
+		//in descending j, the order of a plain backward scan over the prim
+		//window, so scores, backtracks and early breaks are the same as
+		//for that scan.
+		const int32_t numMatches = (int32_t)matchesList.size();
+		primPos.resize(numMatches);
+		blockOf.resize(numMatches);
+		int32_t maxBlock = 0;
+		for (int32_t k = 0; k < numMatches; ++k)
+		{
+			const KmerMatch& m = matchesList[k];
+			primPos[k] = extSorted ? m.extPos : m.curPos;
+			blockOf[k] = (extSorted ? m.curPos : m.extPos) / _maxJump;
+			maxBlock = std::max(maxBlock, blockOf[k]);
+		}
+		blockStart.assign(maxBlock + 2, 0);
+		for (int32_t k = 0; k < numMatches; ++k) ++blockStart[blockOf[k] + 1];
+		for (int32_t b = 0; b <= maxBlock; ++b) blockStart[b + 1] += blockStart[b];
+		blockIdx.resize(numMatches);
+		blockFill.assign(blockStart.begin(), blockStart.end() - 1);
+		for (int32_t k = 0; k < numMatches; ++k) blockIdx[blockFill[blockOf[k]]++] = k;
+		//from here on, blockFill[b] is the end of the already-processed part of block b
+		blockFill.assign(blockStart.begin(), blockStart.end() - 1);
+		++blockFill[blockOf[0]];
+
+		for (int32_t i = 1; i < numMatches; ++i)
 		{
 			int32_t maxScore = 0;
 			int32_t maxId = 0;
-			int32_t curNext = matchesList[i].curPos;
-			int32_t extNext = matchesList[i].extPos;
-			//int32_t noImprovement = 0;
+			const int32_t primNext = primPos[i];
+			const int32_t b = blockOf[i];
+			int32_t pa = blockFill[b] - 1;
+			const int32_t endA = blockStart[b];
+			int32_t pb = b > 0 ? blockFill[b - 1] - 1 : -1;
+			const int32_t endB = b > 0 ? blockStart[b - 1] : 0;
 
-			for (int32_t j = i - 1; j >= 0; --j)
+			while (true)
 			{
-				int32_t curPrev = matchesList[j].curPos;
-				int32_t extPrev = matchesList[j].extPos;
-				int32_t jumpDiv = abs((curNext - curPrev) - 
-									  (extNext - extPrev));
-				if (0 < curNext - curPrev && curNext - curPrev < _maxJump &&
-					0 < extNext - extPrev && extNext - extPrev < _maxJump &&
-					jumpDiv <= MAX_GAP)
-				{
-					int32_t matchScore = 
-						std::min(std::min(curNext - curPrev, extNext - extPrev),
-										  kmerSize);
-					//int32_t gapCost = jumpDiv ? 
-					//		kmerSize * jumpDiv + ilog2_32(jumpDiv) : 0;
-					int32_t gapCost = (jumpDiv > GAP_JUMP_THLD ? LG_GAP : SM_GAP) * jumpDiv;
-					int32_t nextScore = scoreTable[j] + matchScore - gapCost;
-					if (nextScore > maxScore)
-					{
-						maxScore = nextScore;
-						maxId = j;
-						//noImprovement = 0;
-
-						if (jumpDiv == 0 && curNext - curPrev < kmerSize) break;
-					}
-					/*else
-					{
-						if (++noImprovement > MAX_LOOK_BACK) break;
-					}*/
-				}
-				if (extSorted && extNext - extPrev > _maxJump) break;
-				if (!extSorted && curNext - curPrev > _maxJump) break;
+				//within a block, earlier j are no further right on prim,
+				//so once a j is _maxJump away, the rest of its block is too
+				bool okA = pa >= endA && primNext - primPos[blockIdx[pa]] < _maxJump;
+				bool okB = pb >= endB && primNext - primPos[blockIdx[pb]] < _maxJump;
+				if (!okA && !okB) break;
+				int32_t j = (okA && (!okB || blockIdx[pa] > blockIdx[pb])) ?
+							blockIdx[pa--] : blockIdx[pb--];
+				if (tryPredecessor(i, j, maxScore, maxId)) break;
 			}
+			++blockFill[b];
 
 			scoreTable[i] = std::max(maxScore, kmerSize);
 			if (maxScore > kmerSize)
