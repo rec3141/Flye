@@ -181,42 +181,89 @@ std::vector<VertexIndex::KmerFreq>
 	VertexIndex::yieldFrequentKmers(const FastaRecord::Id& seqId,
 									float selectRate, int tandemFreq)
 {
-	thread_local std::unordered_map<Kmer, size_t> localFreq;
-	localFreq.clear();
-	std::vector<KmerFreq> topKmers;
-	topKmers.reserve(_seqContainer.seqLen(seqId));
+	struct FlatSlot
+	{
+		Kmer key;
+		uint32_t count;
+		uint32_t epoch;
+	};
+	thread_local std::vector<FlatSlot> flatTable;
+	thread_local uint32_t curEpoch = 1;
 
-	for (const auto& kmerPos : IterKmers(_seqContainer.getSeq(seqId)))
+	const DnaSequence& seq = _seqContainer.getSeq(seqId);
+	const size_t seqLen = seq.length();
+	if (seqLen < Parameters::get().kmerSize) return {};
+	const size_t numKmers = seqLen - Parameters::get().kmerSize + 1;
+
+	size_t tableMask = 0;
+	if (tandemFreq > 0)
+	{
+		size_t cap = 1024;
+		while (cap < numKmers * 2) cap <<= 1;
+		if (flatTable.size() < cap)
+		{
+			flatTable.assign(cap, FlatSlot{Kmer(0), 0, 0});
+		}
+		tableMask = flatTable.size() - 1;
+		if (++curEpoch == 0)
+		{
+			for (auto& s : flatTable) s.epoch = 0;
+			curEpoch = 1;
+		}
+	}
+
+	std::vector<KmerFreq> topKmers;
+	topKmers.reserve(numKmers);
+
+	for (const auto& kmerPos : IterKmers(seq))
 	{
 		auto stdKmer = kmerPos.kmer;
 		stdKmer.standardForm();
 		size_t freq = _kmerCounter.getFreq(stdKmer);
 
-		++localFreq[stdKmer];
+		if (tandemFreq > 0)
+		{
+			size_t idx = stdKmer.hash() & tableMask;
+			while (flatTable[idx].epoch == curEpoch && flatTable[idx].key != stdKmer)
+			{
+				idx = (idx + 1) & tableMask;
+			}
+			if (flatTable[idx].epoch != curEpoch)
+			{
+				flatTable[idx] = {stdKmer, 1, curEpoch};
+			}
+			else
+			{
+				++flatTable[idx].count;
+			}
+		}
 		topKmers.push_back({kmerPos.kmer, kmerPos.position, freq});
 	}
 
 	if (topKmers.empty()) return {};
-	std::sort(topKmers.begin(), topKmers.end(),
-			  [](const KmerFreq& k1, const KmerFreq& k2)
-			   {return k1.freq > k2.freq;});
-	const size_t maxKmers = selectRate * topKmers.size();
+	const size_t maxKmers = std::min<size_t>(selectRate * topKmers.size(), topKmers.size() - 1);
+	std::nth_element(topKmers.begin(), topKmers.begin() + maxKmers, topKmers.end(),
+					 [](const KmerFreq& k1, const KmerFreq& k2)
+					 {return k1.freq > k2.freq;});
 	const size_t minFreq = topKmers[maxKmers].freq;
 
-	auto itVec = topKmers.begin();
-	while(itVec != topKmers.end() && itVec->freq >= minFreq) ++itVec;
-	topKmers.erase(itVec, topKmers.end());
-
-	if (tandemFreq > 0)
-	{
-		topKmers.erase(std::remove_if(topKmers.begin(), topKmers.end(),
-							[tandemFreq](KmerFreq kf)
+	topKmers.erase(std::remove_if(topKmers.begin(), topKmers.end(),
+						[minFreq, tandemFreq, tableMask](KmerFreq kf)
+						{
+							if (kf.freq < minFreq) return true;
+							if (tandemFreq > 0)
 							{
 								kf.kmer.standardForm();
-								return localFreq[kf.kmer] > (size_t)tandemFreq;
-							}), 
-					   topKmers.end());
-	}
+								size_t idx = kf.kmer.hash() & tableMask;
+								while (flatTable[idx].key != kf.kmer)
+								{
+									idx = (idx + 1) & tableMask;
+								}
+								return flatTable[idx].count > (uint32_t)tandemFreq;
+							}
+							return false;
+						}),
+				   topKmers.end());
 
 	return topKmers;
 }
@@ -430,12 +477,54 @@ void KmerCounter::count(bool useFlatCounter)
 	Logger::get().debug() << "Updating k-mer histogram";
 	if (_useFlatCounter)
 	{
-		for (size_t kmerId = 0; kmerId < COUNTER_LEN * 2; ++kmerId)
+		const size_t numChunks = 256;
+		std::vector<size_t> chunks(numChunks);
+		for (size_t i = 0; i < numChunks; ++i) chunks[i] = i;
+
+		std::mutex histMutex;
+		size_t globalSmallHist[16] = {0};
+		const uint8_t* rawFlat = reinterpret_cast<const uint8_t*>(_flatCounter);
+
+		std::function<void(const size_t&)> scanChunk =
+		[rawFlat, numChunks, &histMutex, &globalSmallHist](const size_t& chunkId)
 		{
-			Kmer kmer(kmerId);
-			size_t freq = this->getFreq(kmer);
-			if (freq > 0) _kmerDistribution[freq] += 1;
-			//if (kmerId % 1000000 == 0) Logger::get().debug() << kmerId << " " << freq;
+			const size_t startByte = (COUNTER_LEN * chunkId) / numChunks;
+			const size_t endByte = (COUNTER_LEN * (chunkId + 1)) / numChunks;
+			size_t localHist[16] = {0};
+
+			size_t i = startByte;
+			for (; i + 8 <= endByte; i += 8)
+			{
+				uint64_t word;
+				std::memcpy(&word, rawFlat + i, sizeof(uint64_t));
+				if (word == 0) continue;
+				for (int b = 0; b < 16; ++b)
+				{
+					++localHist[(word >> (b * 4)) & 0xF];
+				}
+			}
+			for (; i < endByte; ++i)
+			{
+				uint8_t byte = rawFlat[i];
+				if (byte == 0) continue;
+				++localHist[byte & 0xF];
+				++localHist[byte >> 4];
+			}
+
+			histMutex.lock();
+			for (int f = 1; f < 16; ++f) globalSmallHist[f] += localHist[f];
+			histMutex.unlock();
+		};
+		processInParallel(chunks, scanChunk, Parameters::get().numThreads, false);
+
+		for (const auto& kv : _hashCounter.lock_table())
+		{
+			--globalSmallHist[15];
+			_kmerDistribution[15 + kv.second] += 1;
+		}
+		for (size_t f = 1; f < 16; ++f)
+		{
+			if (globalSmallHist[f] > 0) _kmerDistribution[f] += globalSmallHist[f];
 		}
 	}
 	else
